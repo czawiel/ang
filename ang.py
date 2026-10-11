@@ -15,6 +15,14 @@ import pandas as pd
 import streamlit as st
 from gtts import gTTS
 
+try:
+    import libsql_client
+    HAS_LIBSQL = True
+except ImportError:
+    HAS_LIBSQL = False
+
+DEFAULT_TURSO_URL = "libsql://ang-cesar87.aws-eu-north-1.turso.io"
+DEFAULT_TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTE3NTU4MTksImlkIjoiMDFhMTJjZjctZjEwMS03NDliLWFlYjMtOWJlZTZiODEzOWYzIiwia2lkIjoibVU3UXpkTWNJemp0cy00b3ZpUkZNWmx5QUh5ZVU1RmRPVXdhdHhyTDI3RSIsInJpZCI6IjFhYzAxMWI0LTE2OTUtNDdlMC04NGYyLWExYmZjOGZhZjE2YSJ9.HFPs163xNdb-a5FVh6uRIjhLl36Z_4cFcLUJRwewL7Bqa08e66iQ8cr9MjKXBn7A2lFXmpPJgUK_YNByL9KCCw"
 DB_FILE = "flashcards.db"
 
 BOX_INTERVALS = {
@@ -42,11 +50,62 @@ STOP_WORDS = {
 }
 
 
+# --- KLIENT BAZY DANYCH: TURSO / SQLITE ---
+def get_db_client():
+    if not HAS_LIBSQL:
+        return None
+    url = st.secrets.get("turso", {}).get("url", DEFAULT_TURSO_URL)
+    auth_token = st.secrets.get("turso", {}).get("auth_token", DEFAULT_TURSO_TOKEN)
+    if url and auth_token:
+        try:
+            return libsql_client.create_client_sync(url=url, auth_token=auth_token)
+        except Exception:
+            return None
+    return None
+
+
+def execute_db_query(sql: str, params: list = None):
+    params = params or []
+    client = get_db_client()
+    if client:
+        try:
+            rs = client.execute(sql, params)
+            return [tuple(r) for r in rs.rows]
+        finally:
+            client.close()
+    else:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+
+def execute_db_commit(sql: str, params: list = None):
+    params = params or []
+    client = get_db_client()
+    if client:
+        try:
+            client.execute(sql, params)
+            return True, "Zapisano"
+        except Exception as e:
+            return False, str(e)
+        finally:
+            client.close()
+    else:
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                conn.commit()
+                return True, "Zapisano"
+        except Exception as e:
+            return False, str(e)
+
+
 # --- MECHANIZM TŁUMACZENIA ---
 def translate_single_word(word: str, src="en", dest="pl") -> str:
     clean_word = word.strip().lower()
 
-    # 1. MyMemory Translated API
     try:
         url = "https://api.mymemory.translated.net/get"
         params = {"q": clean_word, "langpair": f"{src}|{dest}"}
@@ -59,7 +118,6 @@ def translate_single_word(word: str, src="en", dest="pl") -> str:
     except Exception:
         pass
 
-    # 2. Google GTX API
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -87,64 +145,58 @@ def translate_words_batch(words_list: list, src="en", dest="pl") -> dict:
     return translations
 
 
-# --- BAZA DANYCH SQLITE ---
+# --- BAZA DANYCH ---
 def init_db():
     today_str = date.today().isoformat()
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS words (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                word TEXT NOT NULL UNIQUE,
-                translation TEXT NOT NULL,
-                example_sentence TEXT,
-                category TEXT DEFAULT 'Ogólne',
-                level INTEGER DEFAULT 1,
-                interval INTEGER DEFAULT 1,
-                next_review_date TEXT
-            )
-            """
+    execute_db_commit(
+        """
+        CREATE TABLE IF NOT EXISTS words (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            word TEXT NOT NULL UNIQUE,
+            translation TEXT NOT NULL,
+            example_sentence TEXT,
+            category TEXT DEFAULT 'Ogólne',
+            level INTEGER DEFAULT 1,
+            interval INTEGER DEFAULT 1,
+            next_review_date TEXT
         )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                word_id INTEGER,
-                review_date TEXT NOT NULL,
-                is_correct INTEGER NOT NULL,
-                FOREIGN KEY (word_id) REFERENCES words (id)
-            )
-            """
+        """
+    )
+    execute_db_commit(
+        """
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            word_id INTEGER,
+            review_date TEXT NOT NULL,
+            is_correct INTEGER NOT NULL,
+            FOREIGN KEY (word_id) REFERENCES words (id)
         )
-        conn.commit()
+        """
+    )
 
-        cursor.execute("SELECT COUNT(*) FROM words")
-        if cursor.fetchone()[0] == 0:
-            default_words = [
-                ("apple", "jabłko", "I eat a red apple every morning.", "Jedzenie", 1, 1, today_str),
-                ("negotiation", "negocjacje", "The contract negotiation took three hours.", "Biznes", 1, 1, today_str),
-                ("boarding pass", "karta pokładowa", "Please show your boarding pass at gate 4.", "Podróże", 1, 1, today_str),
-                ("inevitable", "nieunikniony", "Change is inevitable in modern technology.", "Poziom B2", 1, 1, today_str),
-                ("house", "dom", "They bought a new house near the forest.", "Ogólne", 1, 1, today_str),
-            ]
-            cursor.executemany(
+    count_rows = execute_db_query("SELECT COUNT(*) FROM words")
+    if count_rows and count_rows[0][0] == 0:
+        default_words = [
+            ("apple", "jabłko", "I eat a red apple every morning.", "Jedzenie", 1, 1, today_str),
+            ("negotiation", "negocjacje", "The contract negotiation took three hours.", "Biznes", 1, 1, today_str),
+            ("boarding pass", "karta pokładowa", "Please show your boarding pass at gate 4.", "Podróże", 1, 1, today_str),
+            ("inevitable", "nieunikniony", "Change is inevitable in modern technology.", "Poziom B2", 1, 1, today_str),
+            ("house", "dom", "They bought a new house near the forest.", "Ogólne", 1, 1, today_str),
+        ]
+        for item in default_words:
+            execute_db_commit(
                 """
                 INSERT OR IGNORE INTO words 
                 (word, translation, example_sentence, category, level, interval, next_review_date) 
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                default_words,
+                list(item)
             )
-            conn.commit()
 
 
 def get_categories():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT category FROM words WHERE category IS NOT NULL AND category != ''")
-        db_cats = [r[0] for r in cursor.fetchall()]
-        return sorted(list(set(DEFAULT_CATEGORIES + db_cats)))
+    db_cats = [r[0] for r in execute_db_query("SELECT DISTINCT category FROM words WHERE category IS NOT NULL AND category != ''")]
+    return sorted(list(set(DEFAULT_CATEGORIES + db_cats)))
 
 
 def get_words(category_filter="Wszystkie", due_only=False):
@@ -165,55 +217,47 @@ def get_words(category_filter="Wszystkie", due_only=False):
         params.append(today_str)
 
     query += " ORDER BY level ASC, next_review_date ASC"
-
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-        return [
-            {
-                "id": r[0],
-                "word": r[1],
-                "translation": r[2],
-                "example_sentence": r[3] or "",
-                "category": r[4] or "Ogólne",
-                "level": r[5] or 1,
-                "interval": r[6] or 1,
-                "next_review_date": r[7] or today_str,
-            }
-            for r in rows
-        ]
+    rows = execute_db_query(query, params)
+    return [
+        {
+            "id": r[0],
+            "word": r[1],
+            "translation": r[2],
+            "example_sentence": r[3] or "",
+            "category": r[4] or "Ogólne",
+            "level": r[5] or 1,
+            "interval": r[6] or 1,
+            "next_review_date": r[7] or today_str,
+        }
+        for r in rows
+    ]
 
 
 def record_review(word_id, is_correct):
     today_str = date.today().isoformat()
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO reviews (word_id, review_date, is_correct) VALUES (?, ?, ?)",
-            (word_id, today_str, 1 if is_correct else 0),
-        )
-        cursor.execute("SELECT level FROM words WHERE id = ?", (word_id,))
-        row = cursor.fetchone()
-        current_level = row[0] if row else 1
+    execute_db_commit(
+        "INSERT INTO reviews (word_id, review_date, is_correct) VALUES (?, ?, ?)",
+        [word_id, today_str, 1 if is_correct else 0],
+    )
+    rows = execute_db_query("SELECT level FROM words WHERE id = ?", [word_id])
+    current_level = rows[0][0] if rows else 1
 
-        new_level = min(5, current_level + 1) if is_correct else 1
-        new_interval = BOX_INTERVALS[new_level]
-        next_date = (date.today() + timedelta(days=new_interval)).isoformat()
+    new_level = min(5, current_level + 1) if is_correct else 1
+    new_interval = BOX_INTERVALS[new_level]
+    next_date = (date.today() + timedelta(days=new_interval)).isoformat()
 
-        cursor.execute(
-            "UPDATE words SET level = ?, interval = ?, next_review_date = ? WHERE id = ?",
-            (new_level, new_interval, next_date, word_id),
-        )
-        conn.commit()
+    execute_db_commit(
+        "UPDATE words SET level = ?, interval = ?, next_review_date = ? WHERE id = ?",
+        [new_level, new_interval, next_date, word_id],
+    )
 
 
 def get_analytics():
-    with sqlite3.connect(DB_FILE) as conn:
-        df_reviews = pd.read_sql_query("SELECT review_date, is_correct FROM reviews", conn)
-
-    if df_reviews.empty:
+    rows = execute_db_query("SELECT review_date, is_correct FROM reviews")
+    if not rows:
         return {"streak": 0, "weekly_total": 0, "accuracy": 0, "chart_df": None}
+
+    df_reviews = pd.DataFrame(rows, columns=["review_date", "is_correct"])
 
     unique_dates = set(df_reviews["review_date"].unique())
     today = date.today()
@@ -254,31 +298,24 @@ def get_analytics():
 def insert_word(word, translation, example="", category="Ogólne"):
     today_str = date.today().isoformat()
     category = category.strip() if category.strip() else "Ogólne"
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO words 
-                (word, translation, example_sentence, category, level, interval, next_review_date) 
-                VALUES (?, ?, ?, ?, 1, 1, ?)
-                """,
-                (word.strip(), translation.strip(), example.strip(), category, today_str),
-            )
-            conn.commit()
-            return True, "Dodano słówko!"
-    except sqlite3.IntegrityError:
+    ok, msg = execute_db_commit(
+        """
+        INSERT INTO words 
+        (word, translation, example_sentence, category, level, interval, next_review_date) 
+        VALUES (?, ?, ?, ?, 1, 1, ?)
+        """,
+        [word.strip(), translation.strip(), example.strip(), category, today_str]
+    )
+    if ok:
+        return True, "Dodano słówko!"
+    if "UNIQUE" in msg.upper() or "constraint" in msg.lower():
         return False, "Słówko już istnieje w bazie!"
-    except Exception as e:
-        return False, f"Błąd: {e}"
+    return False, f"Błąd bazy: {msg}"
 
 
 def delete_word(word_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM words WHERE id = ?", (word_id,))
-        cursor.execute("DELETE FROM reviews WHERE word_id = ?", (word_id,))
-        conn.commit()
+    execute_db_commit("DELETE FROM words WHERE id = ?", [word_id])
+    execute_db_commit("DELETE FROM reviews WHERE word_id = ?", [word_id])
 
 
 # --- POBIERANIE ZE STRON WWW ---
@@ -286,11 +323,10 @@ def fetch_words_from_article_url(url, max_words=15, min_len=5):
     clean_url = url.strip()
     full_text = ""
 
-    # 1. Wikipedia
     if "wikipedia.org/wiki/" in clean_url:
         title = clean_url.split("/wiki/")[-1].split("#")[0].split("?")[0]
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         api_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&titles={title}&format=json"
         try:
@@ -304,10 +340,9 @@ def fetch_words_from_article_url(url, max_words=15, min_len=5):
         except Exception:
             full_text = ""
 
-    # 2. Portale WWW i strony produktowe
     if not full_text:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept-Language": "en-US,en;q=0.9"
         }
         resp = requests.get(clean_url, headers=headers, timeout=12)
@@ -366,7 +401,7 @@ def fetch_words_from_article_url(url, max_words=15, min_len=5):
     return results
 
 
-# --- POBIERANIE Z YOUTUBE ---
+# --- POBIERANIE Z YOUTUBE Z OBSŁUGĄ BLOKAD CHMURY ---
 def extract_youtube_video_id(url: str) -> str:
     patterns = [
         r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
@@ -380,6 +415,34 @@ def extract_youtube_video_id(url: str) -> str:
     return None
 
 
+def fetch_transcript_fallback(video_id: str):
+    """Pobiera transkrypcję alternatywnymi instancjami, gdy oficjalne serwery blokują IP chmury."""
+    # Lista publicznych serwerów proxy Invidious / Piped
+    instances = [
+        f"https://api.invidious.io/api/v1/captions/{video_id}",
+        f"https://pipedapi.kavin.rocks/streams/{video_id}",
+        f"https://inv.tux.pizza/api/v1/captions/{video_id}",
+    ]
+    for inst in instances:
+        try:
+            r = requests.get(inst, timeout=6)
+            if r.status_code == 200:
+                data = r.json()
+                # Parsowanie napisów z Invidious
+                if isinstance(data, list):
+                    for cap in data:
+                        if cap.get("language_code", "").startswith("en"):
+                            cap_url = cap.get("url")
+                            if cap_url:
+                                sub_res = requests.get(cap_url, timeout=5)
+                                if sub_res.status_code == 200:
+                                    lines = [re.sub(r'<[^>]+>', '', line).strip() for line in sub_res.text.splitlines() if line.strip() and not line.startswith("WEBVTT")]
+                                    return [{"text": l} for l in lines if len(l) > 2]
+        except Exception:
+            continue
+    return None
+
+
 def fetch_and_translate_youtube_transcript(video_url: str, max_words=15, min_len=5):
     video_id = extract_youtube_video_id(video_url)
     if not video_id:
@@ -388,6 +451,7 @@ def fetch_and_translate_youtube_transcript(video_url: str, max_words=15, min_len
     raw_transcript = None
     last_err = None
 
+    # 1. Próba bezpośrednia przez YouTubeTranscriptApi
     try:
         ytt_api = YouTubeTranscriptApi()
         raw_transcript = ytt_api.fetch(video_id, languages=['en', 'en-US', 'en-GB'])
@@ -402,34 +466,29 @@ def fetch_and_translate_youtube_transcript(video_url: str, max_words=15, min_len
         except Exception as e:
             last_err = e
 
+    # 2. Próba awaryjna (gdy chmura AWS/Streamlit ma zablokowany IP)
     if raw_transcript is None:
-        try:
-            list_fn = getattr(YouTubeTranscriptApi, "list_transcripts", None)
-            if callable(list_fn):
-                transcripts = list_fn(video_id)
-                t = transcripts.find_transcript(['en', 'en-US', 'en-GB'])
-                raw_transcript = t.fetch()
-        except Exception as e:
-            last_err = e
+        raw_transcript = fetch_transcript_fallback(video_id)
 
     if raw_transcript is None:
-        raise RuntimeError(f"Nie udało się pobrać transkrypcji z filmu ({last_err}). Upewnij się, że film ma włączone napisy (CC).")
+        raise RuntimeError(
+            f"YouTube zablokował zapytanie z serwera chmurowego ({last_err}). "
+            "Możesz wkleić transkrypcję ręcznie poniżej, aby wyodrębnić słówka!"
+        )
 
     text_segments = []
     for item in raw_transcript:
-        if isinstance(item, dict):
-            txt = item.get("text", "")
-        else:
-            txt = getattr(item, "text", str(item))
-
+        txt = item.get("text", "") if isinstance(item, dict) else getattr(item, "text", str(item))
         txt = re.sub(r'\[.*?\]', '', txt)
         txt = txt.replace('\n', ' ').strip()
         if txt:
             text_segments.append(txt)
 
-    full_text = " ".join(text_segments)
+    return process_text_into_vocabulary(" ".join(text_segments), text_segments, max_words, min_len)
+
+
+def process_text_into_vocabulary(full_text: str, segments: list, max_words: int, min_len: int):
     tokens = re.findall(r'\b[a-zA-Z]{' + str(min_len) + r',}\b', full_text.lower())
-    
     filtered_tokens = [w for w in tokens if w not in STOP_WORDS]
     word_counts = Counter(filtered_tokens).most_common(max_words * 2)
 
@@ -447,7 +506,7 @@ def fetch_and_translate_youtube_transcript(video_url: str, max_words=15, min_len
 
     for word in candidate_words:
         example_sentence = ""
-        for seg in text_segments:
+        for seg in segments:
             if re.search(r'\b' + re.escape(word) + r'\b', seg, re.IGNORECASE):
                 example_sentence = seg
                 break
@@ -524,11 +583,15 @@ with st.sidebar:
             unsafe_allow_html=True
         )
 
+    if HAS_LIBSQL:
+        st.caption("☁️ Baza danych: **Turso Cloud**")
+    else:
+        st.caption("💾 Baza danych: **Lokalne SQLite**")
+
     st.header("🎯 Kategoria")
     filter_opts = ["Wszystkie"] + all_categories
     selected = st.selectbox("Wybierz temat do nauki:", options=filter_opts)
 
-    # Obliczenie i wyświetlenie liczby dostępnych słówek pod kategorią
     cat_all_words = get_words(category_filter=selected, due_only=False)
     cat_due_words = get_words(category_filter=selected, due_only=True)
     total_count = len(cat_all_words)
@@ -655,7 +718,7 @@ with tab_learn:
 # ZAKŁADKA 2: POBIERANIE I TŁUMACZENIE Z YOUTUBE
 with tab_yt:
     st.subheader("🎬 Ekstrakcja słówek z transkrypcji YouTube")
-    st.write("Wklej link do angielskojęzycznego filmu. Program pobierze transkrypcję, wyodrębni kluczowe słowa z filmu wraz z autentycznym kontekstem i przetłumaczy je na język polski.")
+    st.write("Wklej link do filmu YouTube lub wklej bezpośrednio tekst transkrypcji.")
 
     yt_url = st.text_input("Link do filmu YouTube:", placeholder="https://www.youtube.com/watch?v=HLDPA3FTUJ4")
     
@@ -680,9 +743,22 @@ with tab_yt:
                     else:
                         st.warning("Nie znaleziono pasujących słówek.")
                 except Exception as e:
-                    st.error(f"Błąd transkrypcji: {e}")
-                    with st.expander("Szczegóły błędu"):
-                        st.code(traceback.format_exc())
+                    st.error(f"Błąd pobierania automatycznego: {e}")
+
+    # Awaryjne pole na ręczne wklejenie napisów z YouTube
+    with st.expander("📝 Alternatywa: Wklej transkrypcję ręcznie (omija blokady serwera)"):
+        st.caption("Jeśli serwer chmurowy YouTube zablokował adres IP, skopiuj tekst transkrypcji z YouTube i wklej go tutaj:")
+        manual_sub_text = st.text_area("Wklej transkrypcję / tekst angielski:", height=130)
+        if st.button("Wyodrębnij słówka z wklejonego tekstu"):
+            if manual_sub_text.strip():
+                lines = [l.strip() for l in manual_sub_text.splitlines() if l.strip()]
+                extracted = process_text_into_vocabulary(manual_sub_text, lines, yt_limit, yt_min_len)
+                if extracted:
+                    st.session_state.yt_preview = extracted
+                    st.success(f"Przetworzono i przetłumaczono {len(extracted)} słówek!")
+                    st.rerun()
+            else:
+                st.warning("Pole tekstu jest puste!")
 
     if "yt_preview" in st.session_state and st.session_state.yt_preview:
         st.markdown("---")
@@ -773,22 +849,19 @@ with tab_import_export:
 
             if st.button("Zapisz plik do bazy SQL"):
                 today_str = date.today().isoformat()
-                with sqlite3.connect(DB_FILE) as conn:
-                    cursor = conn.cursor()
-                    added = 0
-                    for _, row in df_imported.iterrows():
-                        w = str(row.get("word", "")).strip()
-                        t = str(row.get("translation", "")).strip()
-                        ex = str(row.get("example", "")).strip()
-                        cat = str(row.get("category", "Ogólne")).strip()
-                        if w and t:
-                            cursor.execute(
-                                "INSERT OR IGNORE INTO words (word, translation, example_sentence, category, level, interval, next_review_date) VALUES (?, ?, ?, ?, 1, 1, ?)",
-                                (w, t, ex, cat, today_str)
-                            )
-                            if cursor.rowcount > 0:
-                                added += 1
-                    conn.commit()
+                added = 0
+                for _, row in df_imported.iterrows():
+                    w = str(row.get("word", "")).strip()
+                    t = str(row.get("translation", "")).strip()
+                    ex = str(row.get("example", "")).strip()
+                    cat = str(row.get("category", "Ogólne")).strip()
+                    if w and t:
+                        ok, _ = execute_db_commit(
+                            "INSERT OR IGNORE INTO words (word, translation, example_sentence, category, level, interval, next_review_date) VALUES (?, ?, ?, ?, 1, 1, ?)",
+                            [w, t, ex, cat, today_str]
+                        )
+                        if ok:
+                            added += 1
                 st.success(f"Zaimportowano {added} nowych słówek!")
                 pick_next_card()
                 st.rerun()
