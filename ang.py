@@ -15,13 +15,8 @@ import pandas as pd
 import streamlit as st
 from gtts import gTTS
 
-try:
-    import libsql_client
-    HAS_LIBSQL = True
-except ImportError:
-    HAS_LIBSQL = False
-
-DEFAULT_TURSO_URL = "libsql://ang-cesar87.aws-eu-north-1.turso.io"
+# Konfiguracja Turso HTTP
+DEFAULT_TURSO_URL = "https://ang-cesar87.aws-eu-north-1.turso.io"
 DEFAULT_TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTE3NTU4MTksImlkIjoiMDFhMTJjZjctZjEwMS03NDliLWFlYjMtOWJlZTZiODEzOWYzIiwia2lkIjoibVU3UXpkTWNJemp0cy00b3ZpUkZNWmx5QUh5ZVU1RmRPVXdhdHhyTDI3RSIsInJpZCI6IjFhYzAxMWI0LTE2OTUtNDdlMC04NGYyLWExYmZjOGZhZjE2YSJ9.HFPs163xNdb-a5FVh6uRIjhLl36Z_4cFcLUJRwewL7Bqa08e66iQ8cr9MjKXBn7A2lFXmpPJgUK_YNByL9KCCw"
 DB_FILE = "flashcards.db"
 
@@ -50,56 +45,93 @@ STOP_WORDS = {
 }
 
 
-# --- KLIENT BAZY DANYCH: TURSO / SQLITE ---
-def get_db_client():
-    if not HAS_LIBSQL:
-        return None
+# --- BEZPOŚREDNIE POŁĄCZENIE Z TURSO PRZEZ HTTPS (OMINIĘCIE WEBSOCKET) ---
+def get_turso_credentials():
     url = st.secrets.get("turso", {}).get("url", DEFAULT_TURSO_URL)
-    auth_token = st.secrets.get("turso", {}).get("auth_token", DEFAULT_TURSO_TOKEN)
-    if url and auth_token:
-        try:
-            return libsql_client.create_client_sync(url=url, auth_token=auth_token)
-        except Exception:
-            return None
-    return None
+    token = st.secrets.get("turso", {}).get("auth_token", DEFAULT_TURSO_TOKEN)
+    if url.startswith("libsql://"):
+        url = url.replace("libsql://", "https://")
+    return url.rstrip("/"), token
+
+
+def query_turso_http(sql: str, params: list = None):
+    url, token = get_turso_credentials()
+    if not url or not token:
+        return None, "Brak danych dostępowych do bazy Turso"
+
+    args = []
+    for p in (params or []):
+        if p is None:
+            args.append({"type": "null"})
+        elif isinstance(p, int):
+            args.append({"type": "integer", "value": str(p)})
+        elif isinstance(p, float):
+            args.append({"type": "float", "value": p})
+        else:
+            args.append({"type": "text", "value": str(p)})
+
+    payload = {
+        "requests": [
+            {
+                "type": "execute",
+                "stmt": {
+                    "sql": sql,
+                    "args": args
+                }
+            },
+            {"type": "close"}
+        ]
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        res = requests.post(f"{url}/v2/pipeline", json=payload, headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            resp_data = data["results"][0]["response"]["result"]
+            rows = []
+            for row in resp_data.get("rows", []):
+                parsed_row = []
+                for col in row:
+                    parsed_row.append(col.get("value", None))
+                rows.append(tuple(parsed_row))
+            return rows, None
+        return None, f"Błąd Turso HTTP {res.status_code}: {res.text}"
+    except Exception as e:
+        return None, str(e)
 
 
 def execute_db_query(sql: str, params: list = None):
     params = params or []
-    client = get_db_client()
-    if client:
-        try:
-            rs = client.execute(sql, params)
-            return [tuple(r) for r in rs.rows]
-        finally:
-            client.close()
-    else:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            return cur.fetchall()
+    rows, err = query_turso_http(sql, params)
+    if err is None and rows is not None:
+        return rows
+
+    # Fallback na lokalne sqlite w razie braku połączenia
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
 
 
 def execute_db_commit(sql: str, params: list = None):
     params = params or []
-    client = get_db_client()
-    if client:
-        try:
-            client.execute(sql, params)
+    _, err = query_turso_http(sql, params)
+    if err is None:
+        return True, "Zapisano"
+
+    # Fallback na lokalne sqlite
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            conn.commit()
             return True, "Zapisano"
-        except Exception as e:
-            return False, str(e)
-        finally:
-            client.close()
-    else:
-        try:
-            with sqlite3.connect(DB_FILE) as conn:
-                cur = conn.cursor()
-                cur.execute(sql, params)
-                conn.commit()
-                return True, "Zapisano"
-        except Exception as e:
-            return False, str(e)
+    except Exception as e:
+        return False, str(e)
 
 
 # --- MECHANIZM TŁUMACZENIA ---
@@ -120,7 +152,7 @@ def translate_single_word(word: str, src="en", dest="pl") -> str:
 
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         url = "https://translate.googleapis.com/translate_a/single"
         params = {"client": "gtx", "sl": src, "tl": dest, "dt": "t", "q": clean_word}
@@ -175,7 +207,7 @@ def init_db():
     )
 
     count_rows = execute_db_query("SELECT COUNT(*) FROM words")
-    if count_rows and count_rows[0][0] == 0:
+    if count_rows and int(count_rows[0][0]) == 0:
         default_words = [
             ("apple", "jabłko", "I eat a red apple every morning.", "Jedzenie", 1, 1, today_str),
             ("negotiation", "negocjacje", "The contract negotiation took three hours.", "Biznes", 1, 1, today_str),
@@ -220,14 +252,14 @@ def get_words(category_filter="Wszystkie", due_only=False):
     rows = execute_db_query(query, params)
     return [
         {
-            "id": r[0],
-            "word": r[1],
-            "translation": r[2],
-            "example_sentence": r[3] or "",
-            "category": r[4] or "Ogólne",
-            "level": r[5] or 1,
-            "interval": r[6] or 1,
-            "next_review_date": r[7] or today_str,
+            "id": int(r[0]),
+            "word": str(r[1]),
+            "translation": str(r[2]),
+            "example_sentence": str(r[3] or ""),
+            "category": str(r[4] or "Ogólne"),
+            "level": int(r[5] or 1),
+            "interval": int(r[6] or 1),
+            "next_review_date": str(r[7] or today_str),
         }
         for r in rows
     ]
@@ -240,7 +272,7 @@ def record_review(word_id, is_correct):
         [word_id, today_str, 1 if is_correct else 0],
     )
     rows = execute_db_query("SELECT level FROM words WHERE id = ?", [word_id])
-    current_level = rows[0][0] if rows else 1
+    current_level = int(rows[0][0]) if rows else 1
 
     new_level = min(5, current_level + 1) if is_correct else 1
     new_interval = BOX_INTERVALS[new_level]
@@ -258,6 +290,7 @@ def get_analytics():
         return {"streak": 0, "weekly_total": 0, "accuracy": 0, "chart_df": None}
 
     df_reviews = pd.DataFrame(rows, columns=["review_date", "is_correct"])
+    df_reviews["is_correct"] = pd.to_numeric(df_reviews["is_correct"])
 
     unique_dates = set(df_reviews["review_date"].unique())
     today = date.today()
@@ -325,9 +358,7 @@ def fetch_words_from_article_url(url, max_words=15, min_len=5):
 
     if "wikipedia.org/wiki/" in clean_url:
         title = clean_url.split("/wiki/")[-1].split("#")[0].split("?")[0]
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
         api_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&titles={title}&format=json"
         try:
             r = requests.get(api_url, headers=headers, timeout=10)
@@ -341,10 +372,7 @@ def fetch_words_from_article_url(url, max_words=15, min_len=5):
             full_text = ""
 
     if not full_text:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept-Language": "en-US,en;q=0.9"
-        }
+        headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
         resp = requests.get(clean_url, headers=headers, timeout=12)
         resp.raise_for_status()
 
@@ -401,7 +429,7 @@ def fetch_words_from_article_url(url, max_words=15, min_len=5):
     return results
 
 
-# --- POBIERANIE Z YOUTUBE Z OBSŁUGĄ BLOKAD CHMURY ---
+# --- POBIERANIE Z YOUTUBE ---
 def extract_youtube_video_id(url: str) -> str:
     patterns = [
         r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
@@ -416,19 +444,15 @@ def extract_youtube_video_id(url: str) -> str:
 
 
 def fetch_transcript_fallback(video_id: str):
-    """Pobiera transkrypcję alternatywnymi instancjami, gdy oficjalne serwery blokują IP chmury."""
-    # Lista publicznych serwerów proxy Invidious / Piped
     instances = [
         f"https://api.invidious.io/api/v1/captions/{video_id}",
         f"https://pipedapi.kavin.rocks/streams/{video_id}",
-        f"https://inv.tux.pizza/api/v1/captions/{video_id}",
     ]
     for inst in instances:
         try:
             r = requests.get(inst, timeout=6)
             if r.status_code == 200:
                 data = r.json()
-                # Parsowanie napisów z Invidious
                 if isinstance(data, list):
                     for cap in data:
                         if cap.get("language_code", "").startswith("en"):
@@ -451,7 +475,6 @@ def fetch_and_translate_youtube_transcript(video_url: str, max_words=15, min_len
     raw_transcript = None
     last_err = None
 
-    # 1. Próba bezpośrednia przez YouTubeTranscriptApi
     try:
         ytt_api = YouTubeTranscriptApi()
         raw_transcript = ytt_api.fetch(video_id, languages=['en', 'en-US', 'en-GB'])
@@ -466,14 +489,13 @@ def fetch_and_translate_youtube_transcript(video_url: str, max_words=15, min_len
         except Exception as e:
             last_err = e
 
-    # 2. Próba awaryjna (gdy chmura AWS/Streamlit ma zablokowany IP)
     if raw_transcript is None:
         raw_transcript = fetch_transcript_fallback(video_id)
 
     if raw_transcript is None:
         raise RuntimeError(
             f"YouTube zablokował zapytanie z serwera chmurowego ({last_err}). "
-            "Możesz wkleić transkrypcję ręcznie poniżej, aby wyodrębnić słówka!"
+            "Skorzystaj z pola poniżej i wklej tekst transkrypcji ręcznie!"
         )
 
     text_segments = []
@@ -583,10 +605,7 @@ with st.sidebar:
             unsafe_allow_html=True
         )
 
-    if HAS_LIBSQL:
-        st.caption("☁️ Baza danych: **Turso Cloud**")
-    else:
-        st.caption("💾 Baza danych: **Lokalne SQLite**")
+    st.caption("☁️ Baza danych: **Turso (Direct HTTPS)**")
 
     st.header("🎯 Kategoria")
     filter_opts = ["Wszystkie"] + all_categories
@@ -745,7 +764,6 @@ with tab_yt:
                 except Exception as e:
                     st.error(f"Błąd pobierania automatycznego: {e}")
 
-    # Awaryjne pole na ręczne wklejenie napisów z YouTube
     with st.expander("📝 Alternatywa: Wklej transkrypcję ręcznie (omija blokady serwera)"):
         st.caption("Jeśli serwer chmurowy YouTube zablokował adres IP, skopiuj tekst transkrypcji z YouTube i wklej go tutaj:")
         manual_sub_text = st.text_area("Wklej transkrypcję / tekst angielski:", height=130)
@@ -919,5 +937,5 @@ with tab_stats:
     st.markdown("---")
     st.subheader("📦 Rozkład słówek w pudełkach Leitnera")
     all_current = get_words(category_filter="Wszystkie", due_only=False)
-    box_counts = {f"Pudełko {b} ({BOX_INTERVALS[b]}d)": sum(1 for w in all_current if w["level"] == b) for b in range(1, 6)}
+    box_counts = {f"Pudełko {b} ({BOX_INTERVALS[b]}d)": sum(1 for w in all_current if int(w["level"]) == b) for b in range(1, 6)}
     st.bar_chart(pd.DataFrame.from_dict(box_counts, orient="index", columns=["Liczba słówek"]))
