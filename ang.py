@@ -15,7 +15,7 @@ import pandas as pd
 import streamlit as st
 from gtts import gTTS
 
-# Konfiguracja Turso HTTP
+# --- KONFIGURACJA TURSO HTTP ---
 DEFAULT_TURSO_URL = "https://ang-cesar87.aws-eu-north-1.turso.io"
 DEFAULT_TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTE3NTU4MTksImlkIjoiMDFhMTJjZjctZjEwMS03NDliLWFlYjMtOWJlZTZiODEzOWYzIiwia2lkIjoibVU3UXpkTWNJemp0cy00b3ZpUkZNWmx5QUh5ZVU1RmRPVXdhdHhyTDI3RSIsInJpZCI6IjFhYzAxMWI0LTE2OTUtNDdlMC04NGYyLWExYmZjOGZhZjE2YSJ9.HFPs163xNdb-a5FVh6uRIjhLl36Z_4cFcLUJRwewL7Bqa08e66iQ8cr9MjKXBn7A2lFXmpPJgUK_YNByL9KCCw"
 DB_FILE = "flashcards.db"
@@ -47,8 +47,13 @@ STOP_WORDS = {
 
 # --- BEZPOŚREDNIE POŁĄCZENIE Z TURSO PRZEZ HTTPS (OMINIĘCIE WEBSOCKET) ---
 def get_turso_credentials():
-    url = st.secrets.get("turso", {}).get("url", DEFAULT_TURSO_URL)
-    token = st.secrets.get("turso", {}).get("auth_token", DEFAULT_TURSO_TOKEN)
+    try:
+        url = st.secrets.get("turso", {}).get("url", DEFAULT_TURSO_URL)
+        token = st.secrets.get("turso", {}).get("auth_token", DEFAULT_TURSO_TOKEN)
+    except Exception:
+        url = DEFAULT_TURSO_URL
+        token = DEFAULT_TURSO_TOKEN
+
     if url.startswith("libsql://"):
         url = url.replace("libsql://", "https://")
     return url.rstrip("/"), token
@@ -94,9 +99,7 @@ def query_turso_http(sql: str, params: list = None):
             resp_data = data["results"][0]["response"]["result"]
             rows = []
             for row in resp_data.get("rows", []):
-                parsed_row = []
-                for col in row:
-                    parsed_row.append(col.get("value", None))
+                parsed_row = [col.get("value", None) for col in row]
                 rows.append(tuple(parsed_row))
             return rows, None
         return None, f"Błąd Turso HTTP {res.status_code}: {res.text}"
@@ -227,7 +230,11 @@ def init_db():
 
 
 def get_categories():
-    db_cats = [r[0] for r in execute_db_query("SELECT DISTINCT category FROM words WHERE category IS NOT NULL AND category != ''")]
+    db_cats = [
+        r[0] for r in execute_db_query(
+            "SELECT DISTINCT category FROM words WHERE category IS NOT NULL AND category != ''"
+        )
+    ]
     return sorted(list(set(DEFAULT_CATEGORIES + db_cats)))
 
 
@@ -314,8 +321,8 @@ def get_analytics():
 
     for d in last_7_days:
         subset = df_reviews[df_reviews["review_date"] == d]
-        correct = (subset["is_correct"] == 1).sum()
-        wrong = (subset["is_correct"] == 0).sum()
+        correct = int((subset["is_correct"] == 1).sum())
+        wrong = int((subset["is_correct"] == 0).sum())
         chart_data.append({"Data": d[5:], "Poprawne": correct, "Błędne": wrong})
 
     chart_df = pd.DataFrame(chart_data).set_index("Data")
@@ -460,7 +467,11 @@ def fetch_transcript_fallback(video_id: str):
                             if cap_url:
                                 sub_res = requests.get(cap_url, timeout=5)
                                 if sub_res.status_code == 200:
-                                    lines = [re.sub(r'<[^>]+>', '', line).strip() for line in sub_res.text.splitlines() if line.strip() and not line.startswith("WEBVTT")]
+                                    lines = [
+                                        re.sub(r'<[^>]+>', '', line).strip()
+                                        for line in sub_res.text.splitlines()
+                                        if line.strip() and not line.startswith("WEBVTT")
+                                    ]
                                     return [{"text": l} for l in lines if len(l) > 2]
         except Exception:
             continue
@@ -542,17 +553,117 @@ def process_text_into_vocabulary(full_text: str, segments: list, max_words: int,
     return results
 
 
+@st.cache_data(show_spinner=False)
 def speak_text(text, lang="en"):
     tts = gTTS(text=text, lang=lang)
     fp = io.BytesIO()
     tts.write_to_fp(fp)
     fp.seek(0)
-    return fp
+    return fp.getvalue()
 
 
-# --- INICJALIZACJA STRONY ---
+# --- INICJALIZACJA STRONY I STYLÓW CSS ---
 st.set_page_config(page_title="Fiszki & Narzędzia Nauki", page_icon="🎓", layout="centered")
-init_db()
+
+st.markdown(
+    """
+    <style>
+    /* Główne poprawki kontenera */
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 860px;
+    }
+    
+    /* Stylizacja zakładek (Tabs) */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 6px;
+        background-color: rgba(128, 128, 128, 0.08);
+        padding: 6px;
+        border-radius: 12px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px;
+        padding: 8px 14px;
+        font-weight: 600;
+        border: none !important;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: rgba(79, 70, 229, 0.15) !important;
+        color: #4f46e5 !important;
+    }
+
+    /* Karta Fiszki */
+    .flashcard-box {
+        background: linear-gradient(145deg, rgba(255,255,255,0.05), rgba(128,128,128,0.04));
+        border: 1px solid rgba(128, 128, 128, 0.2);
+        border-radius: 18px;
+        padding: 28px 24px;
+        margin-top: 10px;
+        margin-bottom: 16px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+        text-align: center;
+    }
+    .flashcard-badges {
+        display: flex;
+        justify-content: center;
+        gap: 10px;
+        margin-bottom: 18px;
+        flex-wrap: wrap;
+    }
+    .badge-pill {
+        background: rgba(79, 70, 229, 0.12);
+        color: #6366f1;
+        padding: 4px 14px;
+        border-radius: 999px;
+        font-size: 0.82rem;
+        font-weight: 600;
+        border: 1px solid rgba(99, 102, 241, 0.25);
+    }
+    .flashcard-word {
+        font-size: 2.3rem;
+        font-weight: 800;
+        margin: 10px 0;
+        letter-spacing: -0.5px;
+    }
+    .flashcard-translation {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #10b981;
+        margin: 10px 0;
+    }
+    .flashcard-context {
+        background: rgba(128, 128, 128, 0.07);
+        border-left: 4px solid #6366f1;
+        padding: 12px 16px;
+        border-radius: 6px 12px 12px 6px;
+        font-style: italic;
+        margin: 18px auto 8px auto;
+        max-width: 90%;
+        font-size: 0.98rem;
+        opacity: 0.9;
+    }
+
+    /* Zaokrąglone przyciski i metryki */
+    .stButton > button {
+        border-radius: 10px;
+        font-weight: 600;
+        transition: all 0.15s ease-in-out;
+    }
+    div[data-testid="stMetric"] {
+        background: rgba(128, 128, 128, 0.05);
+        border: 1px solid rgba(128, 128, 128, 0.15);
+        border-radius: 14px;
+        padding: 14px 18px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+if "db_initialized" not in st.session_state:
+    init_db()
+    st.session_state.db_initialized = True
 
 all_categories = get_categories()
 
@@ -585,9 +696,9 @@ with st.sidebar:
             svg_data = base64.b64encode(f.read()).decode("utf-8")
         st.markdown(
             f"""
-            <div style="text-align: center; margin-bottom: 20px;">
+            <div style="text-align: center; margin-bottom: 16px;">
                 <a href="https://fabryka.tech" target="_blank" rel="noopener noreferrer">
-                    <img src="data:image/svg+xml;base64,{svg_data}" alt="Logo" style="max-width: 100%; height: auto; max-height: 70px;"/>
+                    <img src="data:image/svg+xml;base64,{svg_data}" alt="Logo" style="max-width: 100%; height: auto; max-height: 65px;"/>
                 </a>
             </div>
             """,
@@ -596,8 +707,8 @@ with st.sidebar:
     else:
         st.markdown(
             """
-            <div style="text-align: center; margin-bottom: 20px;">
-                <a href="https://fabryka.tech" target="_blank" rel="noopener noreferrer" style="text-decoration: none; font-size: 22px; font-weight: bold; color: inherit;">
+            <div style="text-align: center; margin-bottom: 16px;">
+                <a href="https://fabryka.tech" target="_blank" rel="noopener noreferrer" style="text-decoration: none; font-size: 22px; font-weight: 800; color: inherit;">
                     🏭 Fabryka.tech
                 </a>
             </div>
@@ -606,8 +717,9 @@ with st.sidebar:
         )
 
     st.caption("☁️ Baza danych: **Turso (Direct HTTPS)**")
+    st.divider()
 
-    st.header("🎯 Kategoria")
+    st.subheader("🎯 Kategoria nauki")
     filter_opts = ["Wszystkie"] + all_categories
     selected = st.selectbox("Wybierz temat do nauki:", options=filter_opts)
 
@@ -616,7 +728,9 @@ with st.sidebar:
     total_count = len(cat_all_words)
     due_count = len(cat_due_words)
 
-    st.caption(f"📚 Dostępne słówka: **{total_count}** (na dziś: **{due_count}**)")
+    col_s1, col_s2 = st.columns(2)
+    col_s1.metric("📚 Wszystkie", total_count)
+    col_s2.metric("🔥 Na dziś", due_count)
 
     if selected != st.session_state.selected_category:
         st.session_state.selected_category = selected
@@ -624,39 +738,48 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.header("➕ Dodaj pojedyncze słówko")
-    nw = st.text_input("Słówko (angielski):")
-    nt = st.text_input("Tłumaczenie (polski):")
-    ne = st.text_input("Zdanie przykładowe:")
+    st.subheader("➕ Dodaj pojedyncze słówko")
+    
     c_choice = st.selectbox("Kategoria:", options=all_categories + ["+ Inna..."])
     final_c = st.text_input("Wpisz nową kategorię:") if c_choice == "+ Inna..." else c_choice
 
-    if st.button("Zapisz w bazie", width="stretch"):
-        if nw and nt and final_c:
-            ok, msg = insert_word(nw, nt, ne, final_c)
-            if ok:
-                st.success(msg)
-                pick_next_card()
-                st.rerun()
+    with st.form("add_word_form", clear_on_submit=True):
+        nw = st.text_input("Słówko (angielski):")
+        nt = st.text_input("Tłumaczenie (polski):")
+        ne = st.text_input("Zdanie przykładowe:")
+        submitted = st.form_submit_button("💾 Zapisz w bazie", use_container_width=True, type="primary")
+        if submitted:
+            if nw and nt and final_c:
+                ok, msg = insert_word(nw, nt, ne, final_c)
+                if ok:
+                    st.success(msg)
+                    pick_next_card()
+                    st.rerun()
+                else:
+                    st.warning(msg)
             else:
-                st.warning(msg)
-        else:
-            st.error("Uzupełnij wymagane pola!")
+                st.error("Uzupełnij wymagane pola!")
 
     st.divider()
-    with st.expander("🗑️ Zarządzaj słówkami"):
+    with st.expander(f"🗑️ Zarządzaj słówkami ({total_count})"):
         words_in_cat = get_words(category_filter=st.session_state.selected_category, due_only=False)
+        if not words_in_cat:
+            st.caption("Brak słówek w wybranej kategorii.")
         for item in words_in_cat:
             c1, c2 = st.columns([3, 1])
-            c1.write(f"**{item['word']}** (P.{item['level']})")
-            if c2.button("Usuń", key=f"del_{item['id']}"):
+            c1.markdown(f"**{item['word']}** <small style='opacity:0.7'>(P.{item['level']})</small>", unsafe_allow_html=True)
+            if c2.button("✖", key=f"del_{item['id']}", help="Usuń słówko"):
                 delete_word(item["id"])
                 pick_next_card()
                 st.rerun()
 
     st.divider()
-    st.link_button("📩 Formularz kontaktowy", "https://fabryka.tech/kontakt", width="stretch")
+    st.link_button("📩 Formularz kontaktowy", "https://fabryka.tech/kontakt", use_container_width=True)
 
+
+# --- NAGŁÓWEK GŁÓWNY ---
+st.markdown("## 🎓 Inteligentne Fiszki & Ekstraktor Słów")
+st.caption("Ucz się metodą pudełek Leitnera i automatycznie buduj bazę słownictwa z filmów YouTube oraz artykułów.")
 
 # --- WIDOK GŁÓWNY: ZAKŁADKI ---
 tab_learn, tab_yt, tab_scraper, tab_import_export, tab_stats = st.tabs([
@@ -673,7 +796,7 @@ with tab_learn:
     current_total = get_words(category_filter=st.session_state.selected_category, due_only=False)
 
     if not current_total:
-        st.info("Brak słówek w tej kategorii. Pobierz słówka z YouTube, stron WWW lub załaduj bazę!")
+        st.info("💡 Brak słówek w tej kategorii. Pobierz słówka z YouTube, stron WWW lub dodaj je w pasku bocznym!")
     else:
         if not st.session_state.current_card or st.session_state.current_card not in current_total:
             pick_next_card()
@@ -681,239 +804,272 @@ with tab_learn:
         card = st.session_state.current_card
 
         if len(current_due) == 0:
-            st.success(f"🎉 Wszystkie powtórki na dziś w kategorii **{st.session_state.selected_category}** zrobione!")
+            st.success(f"🎉 Wszystkie powtórki na dziś w kategorii **{st.session_state.selected_category}** zrobione! Możesz kontynuować naukę w trybie swobodnym.")
 
-        st.caption(f"🏷️ Kategoria: {card['category']} | 📦 Pudełko: {card['level']}/5 (co {card['interval']} d.)")
+        # Wizualna Karta Fiszki
+        context_html = (
+            f'<div class="flashcard-context">„{card["example_sentence"]}”</div>'
+            if card.get("example_sentence") else ""
+        )
 
-        col_w, col_a = st.columns([3, 1])
-        with col_w:
-            st.subheader(f"🇬🇧 {card['word']}")
-        with col_a:
+        st.markdown(
+            f"""
+            <div class="flashcard-box">
+                <div class="flashcard-badges">
+                    <span class="badge-pill">🏷️ {card['category']}</span>
+                    <span class="badge-pill">📦 Pudełko {card['level']}/5 (co {card['interval']} dni)</span>
+                </div>
+                <div class="flashcard-word">🇬🇧 {card['word']}</div>
+                {context_html}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # Odtwarzacz audio dla języka angielskiego
+        col_audio_en1, col_audio_en2, col_audio_en3 = st.columns([1, 2, 1])
+        with col_audio_en2:
             try:
                 st.audio(speak_text(card["word"], lang="en"), format="audio/mp3")
             except Exception:
-                st.caption("Brak audio")
-
-        if card.get("example_sentence"):
-            st.markdown(f"*Kontekst:* `{card['example_sentence']}`")
+                st.caption("🔇 Brak audio")
 
         st.write("")
-        if st.button("Pokaż / Ukryj tłumaczenie"):
-            st.session_state.show_translation = not st.session_state.show_translation
-            st.rerun()
+        col_act1, col_act2 = st.columns([3, 1])
+        with col_act1:
+            btn_label = "🙈 Ukryj tłumaczenie" if st.session_state.show_translation else "👁️ Pokaż tłumaczenie"
+            if st.button(btn_label, use_container_width=True, type="primary" if not st.session_state.show_translation else "secondary"):
+                st.session_state.show_translation = not st.session_state.show_translation
+                st.rerun()
+        with col_act2:
+            if st.button("Następne ⏭️", use_container_width=True):
+                pick_next_card()
+                st.rerun()
 
+        # Sekcja odpowiedzi (po odkryciu karty)
         if st.session_state.show_translation:
-            st.markdown("---")
-            col_tw, col_ta = st.columns([3, 1])
-            with col_tw:
-                st.subheader(f"🇵🇱 {card['translation']}")
-            with col_ta:
-                try:
-                    st.audio(speak_text(card["translation"], lang="pl"), format="audio/mp3")
-                except Exception:
-                    st.caption("Brak audio")
+            with st.container(border=True):
+                st.markdown(
+                    f'<div class="flashcard-translation" style="text-align:center;">🇵🇱 {card["translation"]}</div>',
+                    unsafe_allow_html=True
+                )
+                col_audio_pl1, col_audio_pl2, col_audio_pl3 = st.columns([1, 2, 1])
+                with col_audio_pl2:
+                    try:
+                        st.audio(speak_text(card["translation"], lang="pl"), format="audio/mp3")
+                    except Exception:
+                        st.caption("🔇 Brak audio")
 
-            st.write("")
-            col_ok, col_nok = st.columns(2)
-            with col_ok:
-                next_box = min(5, card["level"] + 1)
-                days = BOX_INTERVALS[next_box]
-                if st.button(f"✅ Znam (Pudełko {next_box} za {days} d.)", width="stretch"):
-                    record_review(card["id"], is_correct=True)
-                    pick_next_card()
-                    st.rerun()
-            with col_nok:
-                if st.button("❌ Powtórz (Cofnij do Pudełka 1)", width="stretch"):
-                    record_review(card["id"], is_correct=False)
-                    pick_next_card()
-                    st.rerun()
-
-        st.divider()
-        if st.button("Następne słówko ⏭️"):
-            pick_next_card()
-            st.rerun()
+                st.write("")
+                col_ok, col_nok = st.columns(2)
+                with col_ok:
+                    next_box = min(5, card["level"] + 1)
+                    days = BOX_INTERVALS[next_box]
+                    if st.button(f"✅ Znam (Pudełko {next_box} za {days} d.)", use_container_width=True, type="primary"):
+                        record_review(card["id"], is_correct=True)
+                        pick_next_card()
+                        st.rerun()
+                with col_nok:
+                    if st.button("❌ Powtórz (Cofnij do Pudełka 1)", use_container_width=True):
+                        record_review(card["id"], is_correct=False)
+                        pick_next_card()
+                        st.rerun()
 
 
 # ZAKŁADKA 2: POBIERANIE I TŁUMACZENIE Z YOUTUBE
 with tab_yt:
-    st.subheader("🎬 Ekstrakcja słówek z transkrypcji YouTube")
-    st.write("Wklej link do filmu YouTube lub wklej bezpośrednio tekst transkrypcji.")
+    with st.container(border=True):
+        st.subheader("🎬 Ekstrakcja słówek z transkrypcji YouTube")
+        st.caption("Wklej link do filmu YouTube lub wklej bezpośrednio tekst transkrypcji.")
 
-    yt_url = st.text_input("Link do filmu YouTube:", placeholder="https://www.youtube.com/watch?v=HLDPA3FTUJ4")
-    
-    col_y1, col_y2, col_y3 = st.columns(3)
-    with col_y1:
-        yt_cat = st.text_input("Przypisz kategorię:", value="YouTube")
-    with col_y2:
-        yt_limit = st.slider("Liczba słówek z filmu:", min_value=5, max_value=30, value=15, key="yt_limit")
-    with col_y3:
-        yt_min_len = st.slider("Minimalna długość słowa:", min_value=4, max_value=8, value=5, key="yt_min_len")
+        yt_url = st.text_input("Link do filmu YouTube:", placeholder="https://www.youtube.com/watch?v=HLDPA3FTUJ4")
+        
+        col_y1, col_y2, col_y3 = st.columns(3)
+        with col_y1:
+            yt_cat = st.text_input("Przypisz kategorię:", value="YouTube")
+        with col_y2:
+            yt_limit = st.slider("Liczba słówek z filmu:", min_value=5, max_value=30, value=15, key="yt_limit")
+        with col_y3:
+            yt_min_len = st.slider("Minimalna długość słowa:", min_value=4, max_value=8, value=5, key="yt_min_len")
 
-    if st.button("🎥 Pobierz napisy i przetłumacz", type="primary"):
-        if not yt_url:
-            st.error("Wklej link do filmu!")
-        else:
-            with st.spinner("Pobieranie transkrypcji i tłumaczenie słówek..."):
-                try:
-                    yt_data = fetch_and_translate_youtube_transcript(yt_url, max_words=yt_limit, min_len=yt_min_len)
-                    if yt_data:
-                        st.session_state.yt_preview = yt_data
-                        st.success(f"Znaleziono i przetłumaczono {len(yt_data)} słówek!")
-                    else:
-                        st.warning("Nie znaleziono pasujących słówek.")
-                except Exception as e:
-                    st.error(f"Błąd pobierania automatycznego: {e}")
+        if st.button("🎥 Pobierz napisy i przetłumacz", type="primary", use_container_width=True):
+            if not yt_url:
+                st.error("Wklej link do filmu!")
+            else:
+                with st.spinner("Pobieranie transkrypcji i tłumaczenie słówek..."):
+                    try:
+                        yt_data = fetch_and_translate_youtube_transcript(yt_url, max_words=yt_limit, min_len=yt_min_len)
+                        if yt_data:
+                            st.session_state.yt_preview = yt_data
+                            st.success(f"Znaleziono i przetłumaczono {len(yt_data)} słówek!")
+                        else:
+                            st.warning("Nie znaleziono pasujących słówek.")
+                    except Exception as e:
+                        st.error(f"Błąd pobierania automatycznego: {e}")
 
     with st.expander("📝 Alternatywa: Wklej transkrypcję ręcznie (omija blokady serwera)"):
         st.caption("Jeśli serwer chmurowy YouTube zablokował adres IP, skopiuj tekst transkrypcji z YouTube i wklej go tutaj:")
         manual_sub_text = st.text_area("Wklej transkrypcję / tekst angielski:", height=130)
-        if st.button("Wyodrębnij słówka z wklejonego tekstu"):
+        if st.button("Wyodrębnij słówka z wklejonego tekstu", use_container_width=True):
             if manual_sub_text.strip():
-                lines = [l.strip() for l in manual_sub_text.splitlines() if l.strip()]
-                extracted = process_text_into_vocabulary(manual_sub_text, lines, yt_limit, yt_min_len)
-                if extracted:
-                    st.session_state.yt_preview = extracted
-                    st.success(f"Przetworzono i przetłumaczono {len(extracted)} słówek!")
-                    st.rerun()
+                with st.spinner("Analizowanie tekstu i tłumaczenie..."):
+                    lines = [l.strip() for l in manual_sub_text.splitlines() if l.strip()]
+                    extracted = process_text_into_vocabulary(manual_sub_text, lines, yt_limit, yt_min_len)
+                    if extracted:
+                        st.session_state.yt_preview = extracted
+                        st.success(f"Przetworzono i przetłumaczono {len(extracted)} słówek!")
+                        st.rerun()
             else:
                 st.warning("Pole tekstu jest puste!")
 
     if "yt_preview" in st.session_state and st.session_state.yt_preview:
-        st.markdown("---")
-        st.write("### Podgląd przetłumaczonych słówek:")
-        df_yt = pd.DataFrame(st.session_state.yt_preview)
-        st.dataframe(df_yt, width="stretch")
+        with st.container(border=True):
+            st.markdown("#### 📋 Podgląd przetłumaczonych słówek:")
+            df_yt = pd.DataFrame(st.session_state.yt_preview)
+            st.dataframe(df_yt, use_container_width=True, hide_index=True)
 
-        if st.button("💾 Zapisz słówka z YouTube do bazy SQL", width="stretch"):
-            saved = 0
-            for item in st.session_state.yt_preview:
-                ok, _ = insert_word(
-                    word=item["word"],
-                    translation=item["translation"],
-                    example=item["example"],
-                    category=yt_cat
-                )
-                if ok:
-                    saved += 1
-            st.success(f"Dodano {saved} słówek do bazy fiszek!")
-            del st.session_state.yt_preview
-            pick_next_card()
-            st.rerun()
+            if st.button("💾 Zapisz słówka z YouTube do bazy SQL", use_container_width=True, type="primary"):
+                saved = 0
+                for item in st.session_state.yt_preview:
+                    ok, _ = insert_word(
+                        word=item["word"],
+                        translation=item["translation"],
+                        example=item["example"],
+                        category=yt_cat
+                    )
+                    if ok:
+                        saved += 1
+                st.success(f"Dodano {saved} słówek do bazy fiszek!")
+                del st.session_state.yt_preview
+                pick_next_card()
+                st.rerun()
 
 
 # ZAKŁADKA 3: ZE STRON WWW
 with tab_scraper:
-    st.subheader("🌐 Ekstrakcja słówek z artykułu internetowego")
-    st.write("Wklej link do artykułu w języku angielskim. Aplikacja pobierze treść, wyodrębni słowa i przetłumaczy je na język polski.")
+    with st.container(border=True):
+        st.subheader("🌐 Ekstrakcja słówek z artykułu internetowego")
+        st.caption("Wklej link do artykułu w języku angielskim. Aplikacja pobierze treść, wyodrębni słowa i przetłumaczy je na język polski.")
 
-    article_url = st.text_input("Adres URL strony:", placeholder="https://en.wikipedia.org/wiki/Artificial_intelligence")
-    
-    col_opt1, col_opt2, col_opt3 = st.columns(3)
-    with col_opt1:
-        scrape_category = st.text_input("Przypisz kategorię:", value="Z Internetu", key="scrape_cat")
-    with col_opt2:
-        words_limit = st.slider("Maksymalna liczba słówek:", min_value=5, max_value=30, value=10, key="scr_limit")
-    with col_opt3:
-        min_word_len = st.slider("Minimalna długość słówka:", min_value=4, max_value=8, value=5, key="scr_min_len")
+        article_url = st.text_input("Adres URL strony:", placeholder="https://en.wikipedia.org/wiki/Artificial_intelligence")
+        
+        col_opt1, col_opt2, col_opt3 = st.columns(3)
+        with col_opt1:
+            scrape_category = st.text_input("Przypisz kategorię:", value="Z Internetu", key="scrape_cat")
+        with col_opt2:
+            words_limit = st.slider("Maksymalna liczba słówek:", min_value=5, max_value=30, value=10, key="scr_limit")
+        with col_opt3:
+            min_word_len = st.slider("Minimalna długość słówka:", min_value=4, max_value=8, value=5, key="scr_min_len")
 
-    if st.button("🔍 Pobierz i przetłumacz słówka ze strony", type="primary"):
-        if not article_url:
-            st.error("Podaj prawidłowy adres URL!")
-        else:
-            with st.spinner("Pobieranie danych i analiza..."):
-                try:
-                    scraped_data = fetch_words_from_article_url(article_url, max_words=words_limit, min_len=min_word_len)
-                    if scraped_data:
-                        st.session_state.scraped_preview = scraped_data
-                        st.success(f"Znaleziono i przetłumaczono {len(scraped_data)} słówek!")
-                    else:
-                        st.warning("Nie znaleziono słówek spełniających kryteria.")
-                except Exception as err:
-                    st.error(f"❌ Błąd wykonania: {err}")
-                    with st.expander("Szczegóły błędu"):
-                        st.code(traceback.format_exc())
+        if st.button("🔍 Pobierz i przetłumacz słówka ze strony", type="primary", use_container_width=True):
+            if not article_url:
+                st.error("Podaj prawidłowy adres URL!")
+            else:
+                with st.spinner("Pobieranie danych i analiza..."):
+                    try:
+                        scraped_data = fetch_words_from_article_url(article_url, max_words=words_limit, min_len=min_word_len)
+                        if scraped_data:
+                            st.session_state.scraped_preview = scraped_data
+                            st.success(f"Znaleziono i przetłumaczono {len(scraped_data)} słówek!")
+                        else:
+                            st.warning("Nie znaleziono słówek spełniających kryteria.")
+                    except Exception as err:
+                        st.error(f"❌ Błąd wykonania: {err}")
+                        with st.expander("Szczegóły błędu"):
+                            st.code(traceback.format_exc())
 
     if "scraped_preview" in st.session_state and st.session_state.scraped_preview:
-        st.markdown("---")
-        df_preview = pd.DataFrame(st.session_state.scraped_preview)
-        st.dataframe(df_preview, width="stretch")
+        with st.container(border=True):
+            st.markdown("#### 📋 Podgląd znalezionych słówek:")
+            df_preview = pd.DataFrame(st.session_state.scraped_preview)
+            st.dataframe(df_preview, use_container_width=True, hide_index=True)
 
-        if st.button("💾 Zapisz słówka ze strony do bazy SQL", width="stretch"):
-            saved_count = 0
-            for item in st.session_state.scraped_preview:
-                ok, _ = insert_word(
-                    word=item["word"],
-                    translation=item["translation"],
-                    example=item["example"],
-                    category=scrape_category
-                )
-                if ok:
-                    saved_count += 1
-            st.success(f"Zapisano {saved_count} nowych słówek!")
-            del st.session_state.scraped_preview
-            pick_next_card()
-            st.rerun()
+            if st.button("💾 Zapisz słówka ze strony do bazy SQL", use_container_width=True, type="primary"):
+                saved_count = 0
+                for item in st.session_state.scraped_preview:
+                    ok, _ = insert_word(
+                        word=item["word"],
+                        translation=item["translation"],
+                        example=item["example"],
+                        category=scrape_category
+                    )
+                    if ok:
+                        saved_count += 1
+                st.success(f"Zapisano {saved_count} nowych słówek!")
+                del st.session_state.scraped_preview
+                pick_next_card()
+                st.rerun()
 
 
 # ZAKŁADKA 4: IMPORT I EKSPORT
 with tab_import_export:
-    st.subheader("📥 Masowy import słówek")
-    uploaded_file = st.file_uploader("Wybierz plik CSV lub Excel (.xlsx)", type=["csv", "xlsx"])
+    with st.container(border=True):
+        st.subheader("📥 Masowy import słówek")
+        st.caption("Obsługiwane kolumny: `word`, `translation`, `example` (opcjonalnie), `category` (opcjonalnie).")
+        uploaded_file = st.file_uploader("Wybierz plik CSV lub Excel (.xlsx)", type=["csv", "xlsx"])
 
-    if uploaded_file is not None:
-        try:
-            df_imported = pd.read_csv(uploaded_file, sep=None, engine="python") if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
-            st.dataframe(df_imported.head(3), width="stretch")
+        if uploaded_file is not None:
+            try:
+                df_imported = (
+                    pd.read_csv(uploaded_file, sep=None, engine="python")
+                    if uploaded_file.name.endswith(".csv")
+                    else pd.read_excel(uploaded_file)
+                )
+                df_imported = df_imported.fillna("")
+                st.dataframe(df_imported.head(5), use_container_width=True, hide_index=True)
 
-            if st.button("Zapisz plik do bazy SQL"):
-                today_str = date.today().isoformat()
-                added = 0
-                for _, row in df_imported.iterrows():
-                    w = str(row.get("word", "")).strip()
-                    t = str(row.get("translation", "")).strip()
-                    ex = str(row.get("example", "")).strip()
-                    cat = str(row.get("category", "Ogólne")).strip()
-                    if w and t:
-                        ok, _ = execute_db_commit(
-                            "INSERT OR IGNORE INTO words (word, translation, example_sentence, category, level, interval, next_review_date) VALUES (?, ?, ?, ?, 1, 1, ?)",
-                            [w, t, ex, cat, today_str]
-                        )
-                        if ok:
-                            added += 1
-                st.success(f"Zaimportowano {added} nowych słówek!")
-                pick_next_card()
-                st.rerun()
-        except Exception as e:
-            st.error(f"Błąd pliku: {e}")
+                if st.button("💾 Zapisz plik do bazy SQL", type="primary", use_container_width=True):
+                    today_str = date.today().isoformat()
+                    added = 0
+                    for _, row in df_imported.iterrows():
+                        w = str(row.get("word", "")).strip()
+                        t = str(row.get("translation", "")).strip()
+                        ex = str(row.get("example", "")).strip()
+                        cat = str(row.get("category", "Ogólne")).strip() or "Ogólne"
+                        if w and t:
+                            ok, _ = execute_db_commit(
+                                "INSERT OR IGNORE INTO words (word, translation, example_sentence, category, level, interval, next_review_date) VALUES (?, ?, ?, ?, 1, 1, ?)",
+                                [w, t, ex, cat, today_str]
+                            )
+                            if ok:
+                                added += 1
+                    st.success(f"Zaimportowano {added} nowych słówek!")
+                    pick_next_card()
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Błąd pliku: {e}")
 
-    st.markdown("---")
-    st.subheader("📤 Eksport do Anki i CSV")
-    all_export_words = get_words(category_filter="Wszystkie", due_only=False)
-    if all_export_words:
-        df_export = pd.DataFrame(all_export_words)
-        col_anki, col_csv = st.columns(2)
-        with col_anki:
-            anki_df = pd.DataFrame({
-                "Front": df_export["word"],
-                "Back": df_export["translation"],
-                "Context": df_export["example_sentence"],
-                "Tags": df_export["category"],
-            })
-            st.download_button(
-                "Pobierz dla Anki (.txt)",
-                data=anki_df.to_csv(sep="\t", index=False, header=False, encoding="utf-8"),
-                file_name="fiszki_anki.txt",
-                mime="text/tab-separated-values",
-                width="stretch"
-            )
-        with col_csv:
-            st.download_button(
-                "Pobierz bazę CSV",
-                data=df_export.to_csv(index=False, encoding="utf-8"),
-                file_name="fiszki_baza.csv",
-                mime="text/csv",
-                width="stretch"
-            )
+    with st.container(border=True):
+        st.subheader("📤 Eksport do Anki i CSV")
+        st.caption("Pobierz całą swoją bazę słówek do pliku tekstowego kompatybilnego z Anki lub arkusza CSV.")
+        all_export_words = get_words(category_filter="Wszystkie", due_only=False)
+        if all_export_words:
+            df_export = pd.DataFrame(all_export_words)
+            col_anki, col_csv = st.columns(2)
+            with col_anki:
+                anki_df = pd.DataFrame({
+                    "Front": df_export["word"],
+                    "Back": df_export["translation"],
+                    "Context": df_export["example_sentence"],
+                    "Tags": df_export["category"],
+                })
+                st.download_button(
+                    "🗂️ Pobierz dla Anki (.txt)",
+                    data=anki_df.to_csv(sep="\t", index=False, header=False, encoding="utf-8"),
+                    file_name="fiszki_anki.txt",
+                    mime="text/tab-separated-values",
+                    use_container_width=True
+                )
+            with col_csv:
+                st.download_button(
+                    "📊 Pobierz bazę CSV",
+                    data=df_export.to_csv(index=False, encoding="utf-8"),
+                    file_name="fiszki_baza.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+        else:
+            st.info("Baza jest pusta – brak danych do eksportu.")
 
 
 # ZAKŁADKA 5: STATYSTYKI
@@ -926,16 +1082,22 @@ with tab_stats:
     m2.metric("🎯 Skuteczność (7 dni)", f"{stats['accuracy']}%")
     m3.metric("📚 Powtórki (7 dni)", f"{stats['weekly_total']} słówek")
 
-    st.markdown("---")
-    st.subheader("📅 Aktywność w ostatnich 7 dniach")
+    st.write("")
+    with st.container(border=True):
+        st.markdown("#### 📅 Aktywność w ostatnich 7 dniach")
+        if stats["chart_df"] is not None and stats["weekly_total"] > 0:
+            st.bar_chart(stats["chart_df"], color=["#10b981", "#ef4444"], stack=True)
+        else:
+            st.info("Wykonaj pierwsze powtórki, aby zobaczyć wykres aktywności!")
 
-    if stats["chart_df"] is not None and stats["weekly_total"] > 0:
-        st.bar_chart(stats["chart_df"], color=["#28a745", "#dc3545"], stack=True)
-    else:
-        st.info("Wykonaj pierwsze powtórki, aby zobaczyć wykres aktywności!")
-
-    st.markdown("---")
-    st.subheader("📦 Rozkład słówek w pudełkach Leitnera")
-    all_current = get_words(category_filter="Wszystkie", due_only=False)
-    box_counts = {f"Pudełko {b} ({BOX_INTERVALS[b]}d)": sum(1 for w in all_current if int(w["level"]) == b) for b in range(1, 6)}
-    st.bar_chart(pd.DataFrame.from_dict(box_counts, orient="index", columns=["Liczba słówek"]))
+    with st.container(border=True):
+        st.markdown("#### 📦 Rozkład słówek w pudełkach Leitnera")
+        all_current = get_words(category_filter="Wszystkie", due_only=False)
+        box_counts = {
+            f"Pudełko {b} ({BOX_INTERVALS[b]}d)": sum(1 for w in all_current if int(w["level"]) == b)
+            for b in range(1, 6)
+        }
+        st.bar_chart(
+            pd.DataFrame.from_dict(box_counts, orient="index", columns=["Liczba słówek"]),
+            color="#6366f1"
+        )
